@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import akshare as ak
 from datetime import datetime
+import pytz # 用于确保时区是中国北京时间
 
 # --- 页面配置 ---
 st.set_page_config(page_title="AI 每日量化选股看板 V1.1", layout="wide")
@@ -10,23 +11,28 @@ st.set_page_config(page_title="AI 每日量化选股看板 V1.1", layout="wide")
 
 @st.cache_data(ttl=3600)
 def is_trading_day():
-    """判断今日是否为交易日"""
+    """判断今日是否为 A 股交易日"""
     try:
+        # 强制获取中国北京时间
+        tz = pytz.timezone('Asia/Shanghai')
+        today_str = datetime.now(tz).strftime("%Y-%m-%d")
+        
+        # 获取新浪交易日历
         df = ak.tool_trade_date_hist_sina()
-        today = datetime.now().date()
-        return today in df['trade_date'].values
-    except:
-        return True # 接口失效时默认允许运行
+        # 将日历中的日期统一转为字符串格式进行精准比对
+        trade_dates = [str(d)[:10] for d in df['trade_date'].tolist()]
+        
+        return today_str in trade_dates
+    except Exception as e:
+        return True # 接口偶发失效时，默认放行
 
 @st.cache_data(ttl=1800)
 def get_market_sentiment():
-    """美股昨夜信号 + A股今日跌停家数(简单情绪指标)"""
+    """美股昨夜信号作为大盘情绪参考"""
     try:
-        # 美股信号
         df_us = ak.stock_us_daily(symbol=".INX") 
         us_change = df_us['close'].pct_change().iloc[-1] * 100
         
-        # 建议逻辑
         if us_change < -1.5:
             pos = "3成（极端防守）"
         elif us_change > 1.2:
@@ -37,41 +43,55 @@ def get_market_sentiment():
     except:
         return "5成（参考缺失）", 0.0
 
-@st.cache_data(ttl=600) # 10分钟更新一次，捕捉实时资金流
+@st.cache_data(ttl=600)
 def advanced_screening():
-    """小资金突围逻辑：主力资金异动 + 量价齐升"""
-    # 1. 获取全 A 股实时行情
-    df_all = ak.stock_zh_a_spot_em()
-    
-    # 2. 基础排雷 (过滤ST、次新、北交所、超高价股)
-    df = df_all[~df_all['名称'].str.contains("ST|退市|N|C|U")].copy()
-    df = df[df['代码'].str.startswith(('60', '00', '30'))]
-    df = df[df['最新价'] < 150] # 散户友好，避开超高价
-
-    # 3. 资金面过滤：获取今日主力净流入排名
-    # 这步是关键：只在有大资金参与的标的中寻找
+    """小资金突围逻辑：纯量价齐升过滤（彻底规避海外IP被拦截）"""
     try:
-        df_fund = ak.stock_individual_fund_flow_rank(indicator="今日")
-        top_fund_codes = df_fund.head(150)['代码'].tolist()
-        df = df[df['代码'].isin(top_fund_codes)]
+        # 获取全 A 股实时行情 (最稳定的接口)
+        df_all = ak.stock_zh_a_spot_em()
     except:
-        pass # 接口异常时跳过资金过滤，进入量价过滤
+        return pd.DataFrame() # 接口异常返回空表
+    
+    if df_all.empty:
+        return pd.DataFrame()
 
-    # 4. 硬核量价筛选模型
-    # - 涨幅在 3%~7%：避开跟风盘，寻找主升浪
-    # - 量比 > 1.5：代表成交量异常放大，主力在干活
-    # - 换手率 5%~15%：代表流动性极佳，容易进出
+    # 基础排雷与类型安全转换
+    df = df_all.copy()
+    df['名称'] = df['名称'].astype(str)
+    df['代码'] = df['代码'].astype(str)
+    
+    # 剔除ST、退市、次新、未盈利等标识
+    df = df[~df['名称'].str.contains("ST|退市|N|C|U")]
+    # 仅保留主板(60, 00)和创业板(30)
+    df = df[df['代码'].str.startswith(('60', '00', '30'))]
+    
+    # 强制将需要计算的列转为数值类型，防止 Pandas 报错
+    for col in ['最新价', '涨跌幅', '量比', '换手率']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # 剔除绝对价格过高的股票（散户友好）
+    df = df[df['最新价'] < 150]
+
+    # 核心：硬核量价筛选模型
     final_targets = df[
         (df['涨跌幅'] > 3.0) & (df['涨跌幅'] < 7.5) &
         (df['量比'] > 1.5) &
         (df['换手率'] > 4.0) & (df['换手率'] < 18.0)
     ].copy()
 
-    # 5. 综合打分：量比(40%) + 资金流向(30%) + 涨幅(30%)
+    if final_targets.empty:
+        return pd.DataFrame()
+
+    # 综合打分：权重向“异动放量”倾斜
     final_targets['综合得分'] = (final_targets['量比'] * 5) + (final_targets['涨跌幅'] * 2)
     
-    # 整理输出
+    # 整理输出并保留两位小数
     res = final_targets.sort_values(by="综合得分", ascending=False).head(3)
+    res['综合得分'] = res['综合得分'].round(2)
+    res['量比'] = res['量比'].round(2)
+    res['换手率'] = res['换手率'].round(2)
+    res['涨跌幅'] = res['涨跌幅'].round(2)
+    
     return res[['代码', '名称', '最新价', '涨跌幅', '量比', '换手率', '综合得分']]
 
 # --- 前端展示 ---
@@ -79,14 +99,19 @@ def advanced_screening():
 def main():
     st.title("🏹 AI 每日量化选股 (V1.1 小资金突围版)")
     
-    # 状态区
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # 时区处理，确保显示中国时间
+    tz = pytz.timezone('Asia/Shanghai')
+    today_str = datetime.now(tz).strftime("%Y-%m-%d")
+    
+    # 1. 第一关：校验是否为交易日
     if not is_trading_day():
-        st.error(f"⚠️ 今日 ({today_str}) 为非交易日，系统展示历史缓存，仅供复盘参考。")
-    else:
-        st.success(f"✅ 系统运行中 | 交易日: {today_str}")
+        st.error(f"⚠️ 今日 ({today_str}) 为 A 股非交易日，市场休市。")
+        st.info("💡 系统已自动停止底层数据抓取，以防报错卡死。请在下一个交易日早盘再次访问。")
+        st.stop() # 【关键断点】：遇到非交易日，立刻停止向下执行代码！
+        
+    st.success(f"✅ 系统运行中 | 交易日: {today_str}")
 
-    # 第一行：大盘与仓位
+    # 2. 第二关：大盘与仓位
     col_pos, col_us = st.columns(2)
     pos_advice, us_val = get_market_sentiment()
     
@@ -97,19 +122,21 @@ def main():
 
     st.divider()
 
-    # 第二行：选股结果
+    # 3. 第三关：选股结果
     st.subheader("🔥 今日主力异动高分标的 (Top 3)")
-    st.caption("筛选逻辑：主力净流入前150 + 量比>1.5 + 换手>4% (寻找大资金拉升前的惯性)")
+    st.caption("筛选逻辑：量比>1.5 + 换手>4% + 涨幅3%~7.5% (寻找大资金拉升前的惯性)")
     
-    target_df = advanced_screening()
+    # 增加视觉加载提示，不再干等
+    with st.spinner("正在努力拉取全市场实时数据，预计需要 5-10 秒..."):
+        target_df = advanced_screening()
+        
     if target_df.empty:
-        st.warning("当前行情未触发表达式，建议空仓观望。")
+        st.warning("当前盘面较弱，未触发量价共振逻辑，建议空仓观望。")
     else:
-        # 重命名列以符合用户需求
         target_df.columns = ['股票代码', '名称', '当前价', '涨幅%', '量比', '换手%', '综合打分']
         st.table(target_df)
 
-    # 第三行：生存纪律
+    # 4. 第四关：生存纪律
     st.divider()
     st.subheader("🛡️ T+1 规则下的生存纪律")
     
