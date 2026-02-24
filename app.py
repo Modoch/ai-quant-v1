@@ -4,11 +4,11 @@ import akshare as ak
 from datetime import datetime, time
 import pytz 
 
-# --- 页面配置 (宽屏模式) ---
-st.set_page_config(page_title="AI 量化选股看板 (V1.4 终极融合版)", layout="wide")
+# --- 页面配置 (宽屏模式 + 黑暗模式兼容) ---
+st.set_page_config(page_title="AI 每日量化选股 (V1.5)", layout="wide")
 
 # ==========================================
-# 核心后端逻辑 (保留 V1.3.1 的双源热备与防卡死)
+# 核心后端逻辑
 # ==========================================
 
 @st.cache_data(ttl=3600)
@@ -21,27 +21,44 @@ def is_trading_day():
         trade_dates = [str(d)[:10] for d in df['trade_date'].tolist()]
         return today_str in trade_dates
     except:
-        return True # 接口挂了默认允许运行，防止误杀
+        return True 
 
 @st.cache_data(ttl=600)
 def get_morning_news():
-    """【双源保险】获取财经快讯，优先财联社，失败则切东方财富"""
-    # 通道 1：财联社
-    try:
-        df = ak.stock_telegraph_cls()
-        if not df.empty:
-            df = df.rename(columns={'title': '标题', 'content': '内容', 'publish_time': '时间'})
-            return df[['时间', '标题', '内容']].head(15)
-    except: pass
+    """
+    【V1.5 强力去噪版】
+    只抓取真正的宏观/行业新闻，剔除“资金流向”、“融资融券”等统计数据噪声
+    """
+    # 定义垃圾关键词（出现这些词的新闻直接扔掉）
+    noise_keywords = ["资金", "净流入", "净流出", "融资", "融券", "大宗交易", "主力", "收盘", "开盘"]
     
-    # 通道 2：东方财富
     try:
-        df_em = ak.stock_news_em(symbol="000001")
-        if not df_em.empty:
-            df_em = df_em.rename(columns={'发布时间': '时间', '新闻标题': '标题', '新闻内容': '内容'})
-            if '内容' not in df_em.columns: df_em['内容'] = df_em['标题']
-            return df_em[['时间', '标题', '内容']].head(15)
-    except: pass
+        # 优先使用东方财富-上证指数新闻（通常是宏观大消息）
+        df = ak.stock_news_em(symbol="000001")
+        
+        if df.empty:
+             # 备用：财联社
+            df = ak.stock_telegraph_cls()
+            df = df.rename(columns={'title': '新闻标题', 'content': '新闻内容', 'publish_time': '发布时间'})
+
+        # 数据清洗
+        if not df.empty:
+            # 统一列名
+            df = df.rename(columns={'发布时间': '时间', '新闻标题': '标题', '新闻内容': '内容'})
+            
+            # 如果内容列缺失，用标题填充
+            if '内容' not in df.columns: df['内容'] = df['标题']
+            
+            # --- 核心去噪逻辑 ---
+            # 1. 去掉标题里包含垃圾关键词的行
+            pattern = '|'.join(noise_keywords)
+            df = df[~df['标题'].str.contains(pattern, na=False)]
+            
+            # 2. 如果过滤后太少，可能是有重大事件，不过滤内容，只取前 15 条
+            return df[['时间', '标题', '内容']].head(15)
+            
+    except:
+        pass
 
     return pd.DataFrame()
 
@@ -59,7 +76,7 @@ def get_market_sentiment():
 
 @st.cache_data(ttl=600)
 def advanced_screening():
-    """量价共振选股逻辑"""
+    """量价共振选股逻辑 (V1.1 参数回归版)"""
     try:
         df_all = ak.stock_zh_a_spot_em()
     except: return pd.DataFrame()
@@ -79,10 +96,12 @@ def advanced_screening():
     # 价格过滤
     df = df[df['最新价'] < 100]
 
-    # 核心筛选：量价齐升
+    # --- 核心筛选 (回归 V1.1 参数) ---
+    # 量比 > 1.5 (原V1.4是1.8，现回调)
+    # 涨幅 3% ~ 7.5% (原V1.4是8%，现回调，留0.5%给高开波动)
     final_targets = df[
-        (df['涨跌幅'] > 3.0) & (df['涨跌幅'] < 8.0) &
-        (df['量比'] > 1.8) &
+        (df['涨跌幅'] > 3.0) & (df['涨跌幅'] < 7.5) &
+        (df['量比'] > 1.5) &
         (df['换手率'] > 3.0) & (df['换手率'] < 15.0)
     ].copy()
 
@@ -92,12 +111,12 @@ def advanced_screening():
     final_targets['综合得分'] = (final_targets['量比'] * 5) + (final_targets['涨跌幅'] * 2)
     res = final_targets.sort_values(by="综合得分", ascending=False).head(3)
     
-    # 【新增】获取行业概念
+    # 获取行业概念
     def get_industry(code):
         try:
             info = ak.stock_individual_info_em(symbol=code)
             return info.loc[info['item'] == '行业板块', 'value'].values[0]
-        except: return "未知"
+        except: return "--"
     
     res = res.copy()
     res['行业/概念'] = res['代码'].apply(get_industry)
@@ -106,11 +125,11 @@ def advanced_screening():
     res['综合得分'] = res['综合得分'].round(1)
     res['量比'] = res['量比'].round(2)
     
-    # 调整列顺序，把行业概念放在显眼位置
+    # 调整列顺序
     return res[['代码', '名称', '行业/概念', '最新价', '涨跌幅', '量比', '综合得分']]
 
 # ==========================================
-# 前端展示 (V1.1 布局 + 侧边栏新闻)
+# 前端展示
 # ==========================================
 
 def main():
@@ -119,72 +138,67 @@ def main():
     now_time = datetime.now(tz)
     today_str = now_time.strftime("%Y-%m-%d")
     
-    # --- 侧边栏：新闻与策略 ---
+    # --- 侧边栏布局：策略 + 新闻 ---
     with st.sidebar:
         st.header("📖 策略说明")
         st.info("""
         **核心逻辑：**
-        捕捉主力大资金在盘中留下的“痕迹”。
-        
-        **筛选标准：**
-        1. **量比 > 1.8**：资金进场急切。
-        2. **涨幅 3%~8%**：主升浪启动，非鱼尾。
-        3. **T+1 纪律**：次日不强直接走。
+        A股由于不能做空，大资金拉升必须放量。本系统通过‘量比’监控主力强买入痕迹，利用T+1的时间差赚取情绪溢价。
         """)
         
         st.divider()
         
-        st.header("🗞️ 7x24 财经快讯")
-        st.caption("双源热备：财联社/东方财富")
+        st.subheader("🗞️ 7x24 核心快讯")
+        st.caption("已过滤资金流向噪音，只看宏观/行业")
         
         # 加载新闻
-        with st.spinner("正在刷新消息..."):
+        with st.spinner("正在清洗数据..."):
             news_df = get_morning_news()
         
         if not news_df.empty:
             for index, row in news_df.iterrows():
                 title = str(row.get('标题', '无标题'))
                 time_str = str(row.get('时间', ''))[-8:] # 只取时分秒
-                # 侧边栏用折叠框，节省空间
-                with st.expander(f"⏰ {time_str} | {title[:12]}..."):
-                    st.write(f"**{title}**")
-                    st.caption(row.get('内容', title))
+                
+                # 新闻折叠卡片
+                with st.expander(f"⏰ {time_str} | {title[:11]}..."):
+                    st.markdown(f"**{title}**")
         else:
-            st.warning("暂无最新快讯")
+            st.warning("暂无重大宏观消息")
 
-    # --- 主界面：回归 V1.1 经典布局 ---
+    # --- 主界面 ---
     
-    st.title("🏹 AI 每日量化选股 (V1.4 融合版)")
+    st.title("🏹 AI 每日量化选股 (V1.5 修正版)")
     
     # 状态条
     if is_trading_day():
         st.success(f"✅ 系统运行中 | 交易日: {today_str} | 北京时间: {now_time.strftime('%H:%M')}")
     else:
         st.error(f"⚠️ 休市中 | 日期: {today_str} (A股非交易日)")
-        st.stop() # 休市则停止渲染右侧内容，但侧边栏新闻依然可见！
+        st.stop() 
 
     st.divider()
 
-    # 1. 核心大数字 (V1.1 风格)
+    # 1. 核心大数字
     pos, us_chg = get_market_sentiment()
     
     c1, c2 = st.columns(2)
     with c1:
-        st.metric("核心仓位建议", pos, delta_color="normal")
+        st.metric("核心仓位建议", pos)
     with c2:
         st.metric("美股昨夜波动 (S&P 500)", f"{us_chg:.2f}%", delta=f"{us_chg:.2f}%")
 
-    st.write("") # 留白
     st.write("") 
 
     # 2. 核心选股表格
     st.subheader("🔥 今日主力异动高分标的 (Top 3)")
-    st.caption("筛选逻辑：量比>1.8 + 换手>3% + 涨幅3%~8% (寻找大资金拉升前的惯性)")
+    # 【修正】这里的文案严格回调至 V1.1 版本
+    st.caption("筛选逻辑：量比>1.5 + 换手>3% + 涨幅3%~7% (寻找大资金拉升前的惯性)")
 
     # 开盘时间锁
     market_open_time = time(9, 25) 
     if now_time.time() < market_open_time:
-        st.info("⏳ 还没开盘 (09:25后自动解锁)。请先阅读左侧【财经快讯】寻找今日风口。")
+        st.info("⏳ 还没开盘 (09:25后自动解锁)。请先阅读左侧【核心快讯】寻找今日风口。")
     else:
         with st.spinner("🚀 AI 正在全市场扫描量价异动..."):
             df_result = advanced_screening()
@@ -201,12 +215,11 @@ def main():
             df_show = df_result.copy()
             df_show['代码'] = df_show['代码'].apply(make_link)
             
-            # 渲染 HTML 表格 (保持 V1.1 的整洁感，但支持点击)
             st.write(df_show.to_html(escape=False, index=False), unsafe_allow_html=True)
 
     st.divider()
 
-    # 3. 底部生存纪律 (V1.1 经典红框)
+    # 3. 底部生存纪律
     st.subheader("🛡️ T+1 规则下的生存纪律")
     
     r1, r2, r3 = st.columns(3)
